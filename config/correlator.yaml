@@ -1,0 +1,29 @@
+# Event Correlator — Production Configuration
+#
+# Correlates trade events from multiple source systems by trade ID.
+# Publishes reconciled events when all sources report, or break events
+# when the correlation window expires.
+
+correlator:
+  queue_prefix: recon
+
+  sources:
+    - name: source_a
+      topic: "trades/source_a/>"
+    - name: source_b
+      topic: "trades/source_b/>"
+    - name: source_c
+      topic: "trades/source_c/>"
+
+  expected_sources:
+    - source_a
+    - source_b
+    - source_c
+
+  timing:
+    correlation_window: 5m
+    sweep_interval: 30s
+
+  output:
+    reconciled_topic: "reconciliation/matched"
+    break_topic: "reconciliation/breaks"

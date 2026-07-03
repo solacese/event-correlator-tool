@@ -1,0 +1,27 @@
+# Event Correlator — Development Configuration
+#
+# Shorter windows for faster feedback during local testing.
+
+correlator:
+  queue_prefix: dev-recon
+
+  sources:
+    - name: source_a
+      topic: "trades/source_a/>"
+    - name: source_b
+      topic: "trades/source_b/>"
+    - name: source_c
+      topic: "trades/source_c/>"
+
+  expected_sources:
+    - source_a
+    - source_b
+    - source_c
+
+  timing:
+    correlation_window: 10s
+    sweep_interval: 2s
+
+  output:
+    reconciled_topic: "reconciliation/matched"
+    break_topic: "reconciliation/breaks"
