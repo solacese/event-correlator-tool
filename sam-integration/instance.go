@@ -1,13 +1,14 @@
 // Package instance provides the SAM Go AWE integration shim for the event
-// correlator. This file is meant to live inside the SAM Go repo (e.g. at
-// examples/correlator/internal/instance/) where it can import internal packages.
+// correlator. This file must live inside the SAM Go module tree where it can
+// import internal packages.
 //
-// Copy this file into your SAM Go tree and register:
+// Copy this file into your SAM Go tree (e.g. examples/correlator/internal/instance/)
+// and register:
 //
 //	exe.RegisterKind("correlator", instance.Factory)
 //
-// This is reference code showing exactly how the correlator plugs into SAM.
-// It cannot compile standalone because it imports SAM Go internal packages.
+// This is reference code. It cannot compile standalone because it imports
+// SAM Go internal packages.
 
 package instance
 
@@ -20,26 +21,25 @@ import (
 	"sync"
 	"time"
 
-	// These imports require being inside the SAM Go module tree.
+	// SAM Go internal imports (require being inside the SAM Go module tree).
 	"github.com/SolaceDev/solace-agent-mesh-go/internal/awe"
 	"github.com/SolaceDev/solace-agent-mesh-go/internal/broker"
 	"github.com/SolaceDev/solace-agent-mesh-go/internal/config"
 	"github.com/SolaceDev/solace-agent-mesh-go/internal/runtime"
 
-	// The engine lives in the external repo (or copied locally).
+	// External portable packages from this repo.
 	"github.com/solacese/event-correlator-go/internal/correlator"
 	"github.com/solacese/event-correlator-go/internal/model"
+	"github.com/solacese/event-correlator-go/internal/store"
+	"github.com/solacese/event-correlator-go/internal/store/postgres"
 )
 
-// Compile-time interface checks.
 var (
 	_ awe.Instance = (*Instance)(nil)
 	_ awe.Remover  = (*Instance)(nil)
 )
 
-// Factory is the AWE instance factory. Register with:
-//
-//	exe.RegisterKind("correlator", instance.Factory)
+// Factory is the AWE instance factory for kind "correlator".
 func Factory(cfg config.Config) (awe.Instance, error) {
 	parsed, err := parseConfig(cfg)
 	if err != nil {
@@ -54,6 +54,7 @@ type Instance struct {
 	cfg    *instanceConfig
 	svc    runtime.Services
 	engine *correlator.Engine
+	store  store.Store
 	logger *slog.Logger
 
 	queue  broker.Queue
@@ -64,10 +65,21 @@ type Instance struct {
 func (inst *Instance) Name() string { return inst.name }
 func (inst *Instance) Kind() string { return "correlator" }
 
-func (inst *Instance) Init(_ context.Context, _ config.Config, svc runtime.Services) error {
+func (inst *Instance) Init(ctx context.Context, _ config.Config, svc runtime.Services) error {
 	inst.svc = svc
 	inst.logger = slog.Default().With("component", "correlator", "instance", inst.name)
-	inst.engine = correlator.NewEngine(inst.cfg.ExpectedSources, inst.cfg.CorrelationWindow)
+
+	// Open the database (shared with SAM's session_service).
+	s, err := postgres.New(inst.cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	inst.store = s
+
+	inst.engine = correlator.NewEngine(s, inst.cfg.ExpectedSources, inst.cfg.CorrelationWindow, inst.logger)
 	inst.logger.Info("correlator initialized",
 		"sources", len(inst.cfg.Sources),
 		"expected", inst.cfg.ExpectedSources,
@@ -109,6 +121,9 @@ func (inst *Instance) Stop(_ context.Context) error {
 		inst.cancel()
 	}
 	inst.wg.Wait()
+	if inst.store != nil {
+		_ = inst.store.Close()
+	}
 	inst.logger.Info("correlator stopped", "stats", inst.engine.GetStats())
 	return nil
 }
@@ -156,7 +171,12 @@ func (inst *Instance) receiveLoop(ctx context.Context) {
 			event.Source = inferSource(msg.Topic, inst.cfg.Sources)
 		}
 
-		if reconciled := inst.engine.Ingest(event, time.Now()); reconciled != nil {
+		reconciled, err := inst.engine.Ingest(ctx, event, time.Now())
+		if err != nil {
+			inst.logger.Error("ingest failed", "err", err, "trade_id", event.TradeID)
+			continue
+		}
+		if reconciled != nil {
 			inst.publish(ctx, inst.cfg.ReconciledTopic, reconciled)
 			inst.logger.Info("trade reconciled",
 				"trade_id", reconciled.TradeID,
@@ -174,14 +194,19 @@ func (inst *Instance) sweepLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, brk := range inst.engine.Sweep(time.Now()) {
-				inst.publish(ctx, inst.cfg.BreakTopic, &brk)
+			breaks, err := inst.engine.Sweep(ctx, time.Now())
+			if err != nil {
+				inst.logger.Error("sweep failed", "err", err)
+				continue
+			}
+			for i := range breaks {
+				inst.publish(ctx, inst.cfg.BreakTopic, &breaks[i])
 				inst.logger.Warn("break detected",
-					"trade_id", brk.TradeID,
-					"missing", brk.MissingSources,
+					"trade_id", breaks[i].TradeID,
+					"missing", breaks[i].MissingSources,
 				)
 				if inst.cfg.WorkflowTrigger != "" {
-					inst.triggerWorkflow(ctx, &brk)
+					inst.triggerWorkflow(ctx, &breaks[i])
 				}
 			}
 		}
@@ -221,6 +246,7 @@ type sourceConfig struct {
 type instanceConfig struct {
 	Name              string
 	Namespace         string
+	DatabaseURL       string
 	Sources           []sourceConfig
 	ExpectedSources   []string
 	CorrelationWindow time.Duration
@@ -249,6 +275,18 @@ func parseConfig(cfg config.Config) (*instanceConfig, error) {
 	prefix := appCfg.GetString("queue_prefix")
 	if prefix == "" {
 		prefix = ns
+	}
+
+	// Database URL from session_service block (shared with other SAM components).
+	dbURL := ""
+	if ss := appCfg.GetSection("session_service"); ss != nil {
+		dbURL = ss.GetString("database_url")
+	}
+	if dbURL == "" {
+		dbURL = appCfg.GetString("database_url")
+	}
+	if dbURL == "" {
+		return nil, fmt.Errorf("database_url required (set in app_config.session_service or app_config directly)")
 	}
 
 	window := 5 * time.Minute
@@ -297,6 +335,7 @@ func parseConfig(cfg config.Config) (*instanceConfig, error) {
 	return &instanceConfig{
 		Name:              name,
 		Namespace:         ns,
+		DatabaseURL:       dbURL,
 		Sources:           sources,
 		ExpectedSources:   expected,
 		CorrelationWindow: window,

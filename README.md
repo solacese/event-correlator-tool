@@ -1,15 +1,48 @@
 # Event Correlator for SAM Go
 
-A real-time event correlation engine that runs as a native SAM Go AWE instance kind. It subscribes to multiple Solace topics, correlates trade events by trade ID, and publishes reconciled/break events that trigger downstream SAM workflows.
+A production-ready, Postgres-backed event correlation engine that runs as a native SAM Go AWE instance kind. It subscribes to multiple Solace topics, correlates trade events by trade ID with durable state, maintains a full audit trail, and publishes reconciled/break events that trigger downstream SAM workflows.
+
+## Architecture
+
+```
+Solace Topics (data plane)         SAM Go AWE Process
+─────────────────────────         ──────────────────────────────────
+                                  ┌──────────────────────────────┐
+ trades/solar/>        ────────►  │                              │
+ trades/murex/>        ────────►  │  Correlator Instance         │
+ trades/client_rep/>   ────────►  │  (durable queue, Postgres)   │
+                                  │                              │
+                                  └──────────┬───────────────────┘
+                                             │
+                              ┌──────────────┼──────────────┐
+                              │                             │
+                    reconciliation/matched       reconciliation/breaks
+                              │                             │
+                              │                             ▼
+                              │              ┌──────────────────────┐
+                              │              │  SAM Workflow         │
+                              │              │  "break_investigation"│
+                              │              │  (auto-triggered)     │
+                              │              └──────────────────────┘
+                              ▼
+                   (downstream consumers)
+```
+
+## Key Features
+
+- **Postgres persistence** — correlation state and audit trail survive restarts
+- **Audit log** — every reconciliation and break is recorded with full event detail
+- **Durable Solace queue** — competing consumers for horizontal scaling
+- **SAM workflow trigger** — break events automatically invoke investigation workflows
+- **Graceful lifecycle** — Init/Start/Stop/Remove via AWE control plane
+- **Long correlation windows** — hours or days, not just minutes
 
 ## Quick Start
 
-**1. Register the kind** (one line in `internal/bootstrap/awe.go`):
+**1. Register the kind** (one line in SAM Go's `internal/bootstrap/awe.go`):
 
 ```go
-exe.RegisterKind("correlator", func(cfg config.Config) (awe.Instance, error) {
-    return correlator.InstanceFactory(cfg)
-})
+exe.RegisterKind("correlator", instance.Factory)
 ```
 
 **2. Declare in your SAM config:**
@@ -20,6 +53,8 @@ apps:
     app_config:
       kind: correlator
       namespace: solace-agent-mesh
+      session_service:
+        database_url: ${DATABASE_URL}
       sources:
         - name: solar
           topic: "bbva/trades/solar/>"
@@ -36,39 +71,43 @@ apps:
         workflow_trigger_topic: "solace-agent-mesh/a2a/v1/break_investigation/request"
 ```
 
-**3. Deploy.** The correlator starts alongside your agents and workflows in the same AWE process.
+**3. Deploy.** The correlator starts alongside your agents and workflows in the same AWE process, using SAM's shared Postgres instance.
 
 ## How It Works
 
-```
-Solace Topics (data plane)         SAM Go AWE Process
-─────────────────────────         ─────────────────────────────────
-                                  ┌─────────────────────────────┐
- trades/solar/>        ────────►  │                             │
- trades/murex/>        ────────►  │  Correlator Instance        │
- trades/client_rep/>   ────────►  │  (durable queue, N sources) │
-                                  │                             │
-                                  └──────────┬──────────────────┘
-                                             │
-                              ┌──────────────┼──────────────┐
-                              │                             │
-                    reconciliation/matched       reconciliation/breaks
-                              │                             │
-                              │                             ▼
-                              │              ┌──────────────────────┐
-                              │              │  SAM Workflow         │
-                              │              │  "break_investigation"│
-                              │              │  (auto-triggered)     │
-                              │              └──────────────────────┘
-                              ▼
-                   (downstream consumers)
-```
-
 1. Multiple source systems publish trade events to Solace topics
 2. The correlator subscribes via a single durable queue (supports competing consumers)
-3. Events are correlated by `trade_id` using an in-memory engine
-4. When all expected sources confirm: publish a **reconciled** event
-5. When the correlation window expires with missing sources: publish a **break** event and trigger a SAM workflow to investigate
+3. Each event is persisted to Postgres with the trade's correlation deadline
+4. When all expected sources confirm: publish a **reconciled** event, write audit entry
+5. When the correlation window expires with missing sources: publish a **break** event, trigger a SAM workflow to investigate, write audit entry
+
+## Persistence Model
+
+### `pending_events` table
+
+Holds in-flight correlations. Rows are deleted on reconciliation or break detection.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `trade_id` | TEXT | Trade identifier (composite PK with source) |
+| `source` | TEXT | Source system name |
+| `payload` | JSONB | Full trade event |
+| `first_seen` | TIMESTAMPTZ | When this source first reported |
+| `deadline` | TIMESTAMPTZ | Correlation window expiry |
+
+### `audit_log` table
+
+Immutable regulatory audit trail. Never deleted.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | UUID | Auto-generated |
+| `trade_id` | TEXT | Trade identifier |
+| `outcome` | TEXT | `reconciled` or `break` |
+| `sources` | JSONB | Which sources reported |
+| `detail` | JSONB | Full reconciled/break event payload |
+| `occurred_at` | TIMESTAMPTZ | When the outcome was determined |
+| `recorded_at` | TIMESTAMPTZ | When the audit row was written |
 
 ## SAM Go Integration
 
@@ -78,9 +117,9 @@ The correlator implements the `awe.Instance` interface:
 |--------|----------|
 | `Name()` | Instance name from config |
 | `Kind()` | Returns `"correlator"` |
-| `Init(ctx, cfg, svc)` | Validates config, builds engine |
+| `Init(ctx, cfg, svc)` | Opens DB, runs migrations, builds engine |
 | `Start(ctx)` | Creates queue, subscribes, launches loops |
-| `Stop(ctx)` | Drains work, leaves queue for restart |
+| `Stop(ctx)` | Drains work, closes DB, leaves queue for restart |
 | `Remove(ctx)` | Stops + deprovisions queue (permanent undeploy) |
 | `Health()` | Reports broker connectivity |
 
@@ -90,6 +129,7 @@ See [INTEGRATION.md](INTEGRATION.md) for the full step-by-step guide.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `session_service.database_url` | (required) | Postgres connection string |
 | `sources` | (required) | List of `{name, topic}` source systems |
 | `expected_sources` | (required) | Sources that must all report for reconciliation |
 | `correlation_window` | `5m` | Time to wait for all sources per trade |
@@ -115,6 +155,17 @@ See [INTEGRATION.md](INTEGRATION.md) for the full step-by-step guide.
 }
 ```
 
+### Output: Reconciled Event
+```json
+{
+  "trade_id": "TRD-20260703-000001",
+  "sources": ["client_reporting", "murex", "solar"],
+  "reconciled_at": "2026-07-03T14:30:02Z",
+  "match_duration_ms": 2000,
+  "events": [...]
+}
+```
+
 ### Output: Break Event (triggers workflow)
 ```json
 {
@@ -122,23 +173,26 @@ See [INTEGRATION.md](INTEGRATION.md) for the full step-by-step guide.
   "missing_sources": ["client_reporting"],
   "received_sources": ["murex", "solar"],
   "detected_at": "2026-07-03T14:35:30Z",
-  "window_expiry": "2026-07-03T14:35:00Z"
+  "window_expiry": "2026-07-03T14:35:00Z",
+  "events": [...]
 }
 ```
 
 ## Running Tests
 
-The engine tests are self-contained (no SAM dependency):
+The engine tests use an in-memory store (no Postgres required):
 
 ```bash
-go test -race -count=1 ./internal/correlator/
+go test -race -count=1 ./internal/...
 ```
 
 ## Design Decisions
 
-- **Durable queue with competing consumers**: horizontal scaling without application-level partitioning
+- **Postgres over in-memory**: correlation windows can be hours/days; state must survive restarts; regulatory audit trail is mandatory
+- **Shared SAM database**: uses the same `DATABASE_URL` as SAM's session service; no separate infrastructure
+- **Store interface**: swap Postgres for any backend (the `memory` implementation is used in tests)
+- **UPSERT with ON CONFLICT DO NOTHING**: duplicate source events are idempotent at the DB level
 - **Periodic sweep (not per-trade timers)**: bounds goroutine count regardless of trade volume
-- **Engine/Instance split**: pure correlation logic is unit-testable without broker or SAM
 - **Workflow trigger on break**: configurable A2A publish so SAM workflows react autonomously
 - **Remover interface**: clean undeploy deprovisions broker resources
 

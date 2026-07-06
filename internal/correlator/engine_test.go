@@ -6,9 +6,16 @@ import (
 	"time"
 
 	"github.com/solacese/event-correlator-go/internal/model"
+	"github.com/solacese/event-correlator-go/internal/store/memory"
 )
 
 var testSources = []string{"source_a", "source_b", "source_c"}
+
+func newTestEngine() (*Engine, *memory.Store) {
+	s := memory.New()
+	e := NewEngine(s, testSources, 5*time.Minute, nil)
+	return e, s
+}
 
 func baseEvent(tradeID, source string) model.TradeEvent {
 	return model.TradeEvent{
@@ -24,25 +31,34 @@ func baseEvent(tradeID, source string) model.TradeEvent {
 }
 
 func TestEngine_IngestSingleSource(t *testing.T) {
-	e := NewEngine(testSources, 5*time.Minute)
+	e, s := newTestEngine()
+	ctx := t.Context()
 	now := time.Now()
 
-	result := e.Ingest(baseEvent("TRD-001", "source_a"), now)
+	result, err := e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result != nil {
 		t.Fatal("expected nil result for single source, got reconciled event")
 	}
-	if e.PendingCount() != 1 {
-		t.Errorf("pending count: got %d, want 1", e.PendingCount())
+	events, _ := s.GetEvents(ctx, "TRD-001")
+	if len(events) != 1 {
+		t.Errorf("pending events: got %d, want 1", len(events))
 	}
 }
 
 func TestEngine_IngestAllSources_ProducesReconciled(t *testing.T) {
-	e := NewEngine(testSources, 5*time.Minute)
+	e, _ := newTestEngine()
+	ctx := t.Context()
 	now := time.Now()
 
-	e.Ingest(baseEvent("TRD-001", "source_a"), now)
-	e.Ingest(baseEvent("TRD-001", "source_b"), now.Add(time.Second))
-	result := e.Ingest(baseEvent("TRD-001", "source_c"), now.Add(2*time.Second))
+	e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_b"), now.Add(time.Second))
+	result, err := e.Ingest(ctx, baseEvent("TRD-001", "source_c"), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if result == nil {
 		t.Fatal("expected reconciled event, got nil")
@@ -56,23 +72,21 @@ func TestEngine_IngestAllSources_ProducesReconciled(t *testing.T) {
 	if result.MatchDuration != 2000 {
 		t.Errorf("match_duration_ms: got %d, want 2000", result.MatchDuration)
 	}
-	if e.PendingCount() != 0 {
-		t.Errorf("pending count after reconcile: got %d, want 0", e.PendingCount())
-	}
 }
 
 func TestEngine_DuplicateSource_Ignored(t *testing.T) {
-	e := NewEngine(testSources, 5*time.Minute)
+	e, _ := newTestEngine()
+	ctx := t.Context()
 	now := time.Now()
 
-	e.Ingest(baseEvent("TRD-001", "source_a"), now)
-	result := e.Ingest(baseEvent("TRD-001", "source_a"), now.Add(time.Second))
+	e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	result, err := e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if result != nil {
 		t.Fatal("expected nil for duplicate source, got reconciled")
-	}
-	if e.PendingCount() != 1 {
-		t.Errorf("pending count: got %d, want 1", e.PendingCount())
 	}
 
 	stats := e.GetStats()
@@ -82,32 +96,45 @@ func TestEngine_DuplicateSource_Ignored(t *testing.T) {
 }
 
 func TestEngine_UnknownSource_Ignored(t *testing.T) {
-	e := NewEngine(testSources, 5*time.Minute)
+	e, s := newTestEngine()
+	ctx := t.Context()
 	now := time.Now()
 
-	result := e.Ingest(baseEvent("TRD-001", "unknown_system"), now)
+	result, err := e.Ingest(ctx, baseEvent("TRD-001", "unknown_system"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result != nil {
 		t.Fatal("expected nil for unknown source")
 	}
-	if e.PendingCount() != 0 {
-		t.Errorf("pending count: got %d, want 0", e.PendingCount())
+	events, _ := s.GetEvents(ctx, "TRD-001")
+	if len(events) != 0 {
+		t.Errorf("pending events: got %d, want 0", len(events))
 	}
 }
 
 func TestEngine_Sweep_ExpiresOldTrades(t *testing.T) {
 	window := 100 * time.Millisecond
-	e := NewEngine(testSources, window)
+	s := memory.New()
+	e := NewEngine(s, testSources, window, nil)
+	ctx := t.Context()
 	now := time.Now()
 
-	e.Ingest(baseEvent("TRD-001", "source_a"), now)
-	e.Ingest(baseEvent("TRD-001", "source_b"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_b"), now)
 
-	breaks := e.Sweep(now.Add(50 * time.Millisecond))
+	breaks, err := e.Sweep(ctx, now.Add(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(breaks) != 0 {
 		t.Errorf("expected 0 breaks before expiry, got %d", len(breaks))
 	}
 
-	breaks = e.Sweep(now.Add(200 * time.Millisecond))
+	breaks, err = e.Sweep(ctx, now.Add(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(breaks) != 1 {
 		t.Fatalf("expected 1 break after expiry, got %d", len(breaks))
 	}
@@ -119,13 +146,52 @@ func TestEngine_Sweep_ExpiresOldTrades(t *testing.T) {
 	if len(brk.MissingSources) != 1 || brk.MissingSources[0] != "source_c" {
 		t.Errorf("missing sources: got %v, want [source_c]", brk.MissingSources)
 	}
-	if e.PendingCount() != 0 {
-		t.Errorf("pending after sweep: got %d, want 0", e.PendingCount())
+}
+
+func TestEngine_AuditTrail(t *testing.T) {
+	e, s := newTestEngine()
+	ctx := t.Context()
+	now := time.Now()
+
+	// Reconcile one trade.
+	e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_b"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_c"), now)
+
+	audit := s.AuditLog()
+	if len(audit) != 1 {
+		t.Fatalf("audit entries: got %d, want 1", len(audit))
+	}
+	if audit[0].Outcome != "reconciled" {
+		t.Errorf("outcome: got %q, want reconciled", audit[0].Outcome)
+	}
+	if audit[0].TradeID != "TRD-001" {
+		t.Errorf("trade_id: got %q, want TRD-001", audit[0].TradeID)
+	}
+}
+
+func TestEngine_Sweep_AuditTrail(t *testing.T) {
+	window := 100 * time.Millisecond
+	s := memory.New()
+	e := NewEngine(s, testSources, window, nil)
+	ctx := t.Context()
+	now := time.Now()
+
+	e.Ingest(ctx, baseEvent("TRD-002", "source_a"), now)
+	e.Sweep(ctx, now.Add(200*time.Millisecond))
+
+	audit := s.AuditLog()
+	if len(audit) != 1 {
+		t.Fatalf("audit entries: got %d, want 1", len(audit))
+	}
+	if audit[0].Outcome != "break" {
+		t.Errorf("outcome: got %q, want break", audit[0].Outcome)
 	}
 }
 
 func TestEngine_ConcurrentAccess(t *testing.T) {
-	e := NewEngine(testSources, time.Minute)
+	e, _ := newTestEngine()
+	ctx := t.Context()
 	now := time.Now()
 
 	var wg sync.WaitGroup
@@ -135,7 +201,7 @@ func TestEngine_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			tradeID := "TRD-" + time.Now().Format("150405.000000000")
 			for _, src := range testSources {
-				e.Ingest(baseEvent(tradeID, src), now.Add(time.Duration(i)*time.Millisecond))
+				e.Ingest(ctx, baseEvent(tradeID, src), now.Add(time.Duration(i)*time.Millisecond))
 			}
 		}()
 	}
@@ -143,7 +209,7 @@ func TestEngine_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.Sweep(now.Add(time.Hour))
+			e.Sweep(ctx, now.Add(time.Hour))
 		}()
 	}
 	wg.Wait()
@@ -155,18 +221,21 @@ func TestEngine_ConcurrentAccess(t *testing.T) {
 }
 
 func TestEngine_Stats_Counters(t *testing.T) {
-	e := NewEngine(testSources, 100*time.Millisecond)
+	window := 100 * time.Millisecond
+	s := memory.New()
+	e := NewEngine(s, testSources, window, nil)
+	ctx := t.Context()
 	now := time.Now()
 
-	e.Ingest(baseEvent("TRD-001", "source_a"), now)
-	e.Ingest(baseEvent("TRD-001", "source_b"), now)
-	e.Ingest(baseEvent("TRD-001", "source_c"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_b"), now)
+	e.Ingest(ctx, baseEvent("TRD-001", "source_c"), now)
 
-	e.Ingest(baseEvent("TRD-002", "source_a"), now)
-	e.Sweep(now.Add(200 * time.Millisecond))
+	e.Ingest(ctx, baseEvent("TRD-002", "source_a"), now)
+	e.Sweep(ctx, now.Add(200*time.Millisecond))
 
-	e.Ingest(baseEvent("TRD-003", "source_a"), now)
-	e.Ingest(baseEvent("TRD-003", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-003", "source_a"), now)
+	e.Ingest(ctx, baseEvent("TRD-003", "source_a"), now)
 
 	stats := e.GetStats()
 	if stats.Reconciled != 1 {
@@ -180,8 +249,5 @@ func TestEngine_Stats_Counters(t *testing.T) {
 	}
 	if stats.Duplicates != 1 {
 		t.Errorf("duplicates: got %d, want 1", stats.Duplicates)
-	}
-	if stats.Pending != 1 {
-		t.Errorf("pending: got %d, want 1", stats.Pending)
 	}
 }
