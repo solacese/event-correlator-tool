@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/solacecommunity/event-correlator-go/internal/model"
+	"github.com/solacese/event-correlator-go/internal/model"
 )
 
 // pendingTrade tracks which source systems have reported for a single trade ID.
@@ -59,7 +59,6 @@ func NewEngine(expectedSources []string, window time.Duration) *Engine {
 func (e *Engine) Ingest(event model.TradeEvent, now time.Time) *model.ReconciledEvent {
 	e.received.Add(1)
 
-	// Ignore events from unknown sources.
 	if _, known := e.expectedSources[event.Source]; !known {
 		return nil
 	}
@@ -78,7 +77,6 @@ func (e *Engine) Ingest(event model.TradeEvent, now time.Time) *model.Reconciled
 		e.pending[event.TradeID] = pt
 	}
 
-	// Duplicate source for same trade — skip.
 	if _, dup := pt.events[event.Source]; dup {
 		e.duplicates.Add(1)
 		return nil
@@ -86,12 +84,11 @@ func (e *Engine) Ingest(event model.TradeEvent, now time.Time) *model.Reconciled
 
 	pt.events[event.Source] = event
 
-	// Check if all expected sources are present.
 	if len(pt.events) < len(e.expectedSources) {
 		return nil
 	}
 
-	// All sources arrived — reconcile.
+	// All sources arrived.
 	delete(e.pending, event.TradeID)
 	e.reconciled.Add(1)
 
@@ -113,7 +110,6 @@ func (e *Engine) Ingest(event model.TradeEvent, now time.Time) *model.Reconciled
 }
 
 // Sweep checks all pending trades for expired correlation windows.
-// Returns break events for any expired correlations.
 func (e *Engine) Sweep(now time.Time) []model.BreakEvent {
 	e.mu.Lock()
 	defer e.mu.Unlock()

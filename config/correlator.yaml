@@ -1,8 +1,5 @@
-# Event Correlator — Production Configuration
-#
-# Correlates trade events from multiple source systems by trade ID.
-# Publishes reconciled events when all sources report, or break events
-# when the correlation window expires.
+# Standalone correlator configuration (for running outside SAM).
+# Use config/sam-correlator.yaml for SAM Go AWE deployment.
 
 correlator:
   queue_prefix: recon

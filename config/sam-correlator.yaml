@@ -1,0 +1,44 @@
+# SAM Go AWE Configuration
+# Deploy the event correlator as a managed instance alongside your agents.
+#
+# This file is loaded by the AWE process. The correlator appears in SAM's
+# control plane, health checks, and can be deployed/undeployed dynamically.
+
+apps:
+  - name: trade_correlator
+    app_config:
+      kind: correlator
+      namespace: solace-agent-mesh
+
+      # Source systems to correlate. Each subscribes via the shared durable queue.
+      sources:
+        - name: solar
+          topic: "bbva/trades/solar/>"
+        - name: murex
+          topic: "bbva/trades/murex/>"
+        - name: client_reporting
+          topic: "bbva/trades/client_reporting/>"
+
+      # All sources that must report for a successful reconciliation.
+      expected_sources:
+        - solar
+        - murex
+        - client_reporting
+
+      # Time window and sweep frequency.
+      correlation_window: 5m
+      sweep_interval: 30s
+
+      # Optional: prefix for the durable queue name (default: namespace).
+      queue_prefix: bbva-recon
+
+      output:
+        # Topic where reconciled events are published.
+        reconciled_topic: "bbva/reconciliation/matched"
+
+        # Topic where break events are published.
+        break_topic: "bbva/reconciliation/breaks"
+
+        # Optional: publish to this topic to trigger a SAM workflow on break.
+        # The workflow receives the break details as its input message.
+        workflow_trigger_topic: "solace-agent-mesh/a2a/v1/break_investigation/request"

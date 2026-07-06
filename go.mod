@@ -1,3 +1,3 @@
-module github.com/solacecommunity/event-correlator-go
+module github.com/solacese/event-correlator-go
 
 go 1.22

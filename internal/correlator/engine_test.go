@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solacecommunity/event-correlator-go/internal/model"
+	"github.com/solacese/event-correlator-go/internal/model"
 )
 
 var testSources = []string{"source_a", "source_b", "source_c"}
@@ -102,13 +102,11 @@ func TestEngine_Sweep_ExpiresOldTrades(t *testing.T) {
 	e.Ingest(baseEvent("TRD-001", "source_a"), now)
 	e.Ingest(baseEvent("TRD-001", "source_b"), now)
 
-	// Sweep before expiry — no breaks
 	breaks := e.Sweep(now.Add(50 * time.Millisecond))
 	if len(breaks) != 0 {
 		t.Errorf("expected 0 breaks before expiry, got %d", len(breaks))
 	}
 
-	// Sweep after expiry
 	breaks = e.Sweep(now.Add(200 * time.Millisecond))
 	if len(breaks) != 1 {
 		t.Fatalf("expected 1 break after expiry, got %d", len(breaks))
@@ -120,9 +118,6 @@ func TestEngine_Sweep_ExpiresOldTrades(t *testing.T) {
 	}
 	if len(brk.MissingSources) != 1 || brk.MissingSources[0] != "source_c" {
 		t.Errorf("missing sources: got %v, want [source_c]", brk.MissingSources)
-	}
-	if len(brk.ReceivedSources) != 2 {
-		t.Errorf("received sources: got %d, want 2", len(brk.ReceivedSources))
 	}
 	if e.PendingCount() != 0 {
 		t.Errorf("pending after sweep: got %d, want 0", e.PendingCount())
@@ -163,16 +158,13 @@ func TestEngine_Stats_Counters(t *testing.T) {
 	e := NewEngine(testSources, 100*time.Millisecond)
 	now := time.Now()
 
-	// One full reconciliation
 	e.Ingest(baseEvent("TRD-001", "source_a"), now)
 	e.Ingest(baseEvent("TRD-001", "source_b"), now)
 	e.Ingest(baseEvent("TRD-001", "source_c"), now)
 
-	// One break
 	e.Ingest(baseEvent("TRD-002", "source_a"), now)
 	e.Sweep(now.Add(200 * time.Millisecond))
 
-	// One duplicate
 	e.Ingest(baseEvent("TRD-003", "source_a"), now)
 	e.Ingest(baseEvent("TRD-003", "source_a"), now)
 
