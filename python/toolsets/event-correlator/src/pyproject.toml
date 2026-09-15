@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sam-event-correlator"
+version = "0.1.0"
+description = "PostgreSQL-backed event correlation tools for Solace Agent Mesh"
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+    "sam-tool-sdk>=0.1,<0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
+[project.scripts]
+event-correlator = "event_correlator:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/event_correlator"]
+artifacts = ["src/event_correlator/migrations/*.sql"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+# SAM CLI version that scaffolded this tool: 2.215.9

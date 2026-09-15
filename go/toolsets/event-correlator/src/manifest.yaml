@@ -1,0 +1,7 @@
+version: 1
+tools:
+  event_correlator_tools:
+    runtime: go
+    executable: ./event-correlator
+    timeout_seconds: 60
+    sandbox_profile: standard

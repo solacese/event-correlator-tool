@@ -1,200 +1,99 @@
-# Event Correlator for Solace Agent Mesh
+# Event Correlator Toolset for Solace Agent Mesh
 
-A production-ready, Postgres-backed event correlation engine that runs as a native SAM Go AWE instance kind. It subscribes to multiple Solace topics, correlates trade events by trade ID with durable state, maintains a full audit trail, and publishes reconciled/break events that trigger downstream SAM workflows.
+PostgreSQL-backed trade-event correlation for Solace Agent Mesh, available as interchangeable Go and Python Secure Tool Runtime toolsets.
 
-## Architecture
+## Layout
 
-```
-Solace Topics (data plane)         SAM Go AWE Process
-─────────────────────────         ──────────────────────────────────
-                                  ┌──────────────────────────────┐
- trades/solar/>        ────────►  │                              │
- trades/murex/>        ────────►  │  Correlator Instance         │
- trades/client_rep/>   ────────►  │  (durable queue, Postgres)   │
-                                  │                              │
-                                  └──────────┬───────────────────┘
-                                             │
-                              ┌──────────────┼──────────────┐
-                              │                             │
-                    reconciliation/matched       reconciliation/breaks
-                              │                             │
-                              │                             ▼
-                              │              ┌──────────────────────┐
-                              │              │  SAM Workflow         │
-                              │              │  "break_investigation"│
-                              │              │  (auto-triggered)     │
-                              │              └──────────────────────┘
-                              ▼
-                   (downstream consumers)
+```text
+.
+├── go/       # Go toolset project
+├── python/   # Python toolset project
+└── config.yaml
 ```
 
-## Key Features
+Each language directory is a standalone SAM declarative-config root with an `event-correlator` toolset. Choose one language root for deployment; both implementations expose the same tool names, inputs, results, configuration, and PostgreSQL schema.
 
-- **Postgres persistence** — correlation state and audit trail survive restarts
-- **Audit log** — every reconciliation and break is recorded with full event detail
-- **Durable Solace queue** — competing consumers for horizontal scaling
-- **SAM workflow trigger** — break events automatically invoke investigation workflows
-- **Graceful lifecycle** — Init/Start/Stop/Remove via AWE control plane
-- **Long correlation windows** — hours or days, not just minutes
+## Tools
 
-## Quick Start
+| Tool | Purpose |
+|---|---|
+| `ingest_trade_event` | Persist one source event. Returns `pending`, `duplicate`, `ignored_unknown_source`, or a complete `reconciled` event. |
+| `sweep_expired_trades` | Finalize incomplete trades whose correlation window has elapsed and return break events. |
+| `get_audit_history` | Query newest-first reconciliation and break audit entries. |
 
-**1. Register the kind** (one line in SAM Go's `internal/bootstrap/awe.go`):
+The toolset runtime is request/response. Connectors, workflows, or agents should call `ingest_trade_event` for incoming events. Schedule `sweep_expired_trades` at the desired cadence; unlike the previous AWE instance, a toolset does not keep a background broker subscription or timer alive.
 
-```go
-exe.RegisterKind("correlator", instance.Factory)
-```
+## Shared configuration
 
-**2. Declare in your SAM config:**
+[config.yaml](config.yaml) documents values shared by both implementations:
+
+- `database_url` — PostgreSQL DSN, stored as a secret toolset configuration value.
+- `expected_sources` — comma-separated source names.
+- `correlation_window_seconds` — positive correlation-window duration.
+
+Attach exactly one implementation to an agent:
 
 ```yaml
-apps:
-  - name: trade_correlator
-    app_config:
-      kind: correlator
-      namespace: solace-agent-mesh
-      session_service:
+spec:
+  toolsets:
+    - event-correlator
+  toolsetConfigs:
+    - toolsetName: event-correlator
+      configValues:
         database_url: ${DATABASE_URL}
-      sources:
-        - name: solar
-          topic: "bbva/trades/solar/>"
-        - name: murex
-          topic: "bbva/trades/murex/>"
-        - name: client_reporting
-          topic: "bbva/trades/client_reporting/>"
-      expected_sources: [solar, murex, client_reporting]
-      correlation_window: 5m
-      sweep_interval: 30s
-      output:
-        reconciled_topic: "bbva/reconciliation/matched"
-        break_topic: "bbva/reconciliation/breaks"
-        workflow_trigger_topic: "solace-agent-mesh/a2a/v1/break_investigation/request"
+        expected_sources: solar,murex,client_reporting
+        correlation_window_seconds: 300
 ```
 
-**3. Deploy.** The correlator starts alongside your agents and workflows in the same AWE process, using SAM's shared Postgres instance.
+Run `sam config apply` from [go/](go/) for the Go option or [python/](python/) for the Python option.
 
-## How It Works
-
-1. Multiple source systems publish trade events to Solace topics
-2. The correlator subscribes via a single durable queue (supports competing consumers)
-3. Each event is persisted to Postgres with the trade's correlation deadline
-4. When all expected sources confirm: publish a **reconciled** event, write audit entry
-5. When the correlation window expires with missing sources: publish a **break** event, trigger a SAM workflow to investigate, write audit entry
-
-## Persistence Model
-
-### `pending_events` table
-
-Holds in-flight correlations. Rows are deleted on reconciliation or break detection.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `trade_id` | TEXT | Trade identifier (composite PK with source) |
-| `source` | TEXT | Source system name |
-| `payload` | JSONB | Full trade event |
-| `first_seen` | TIMESTAMPTZ | When this source first reported |
-| `deadline` | TIMESTAMPTZ | Correlation window expiry |
-
-### `audit_log` table
-
-Immutable regulatory audit trail. Never deleted.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Auto-generated |
-| `trade_id` | TEXT | Trade identifier |
-| `outcome` | TEXT | `reconciled` or `break` |
-| `sources` | JSONB | Which sources reported |
-| `detail` | JSONB | Full reconciled/break event payload |
-| `occurred_at` | TIMESTAMPTZ | When the outcome was determined |
-| `recorded_at` | TIMESTAMPTZ | When the audit row was written |
-
-## SAM Go Integration
-
-The correlator implements the `awe.Instance` interface:
-
-| Method | Behavior |
-|--------|----------|
-| `Name()` | Instance name from config |
-| `Kind()` | Returns `"correlator"` |
-| `Init(ctx, cfg, svc)` | Opens DB, runs migrations, builds engine |
-| `Start(ctx)` | Creates queue, subscribes, launches loops |
-| `Stop(ctx)` | Drains work, closes DB, leaves queue for restart |
-| `Remove(ctx)` | Stops + deprovisions queue (permanent undeploy) |
-| `Health()` | Reports broker connectivity |
-
-See [INTEGRATION.md](INTEGRATION.md) for the full step-by-step guide.
-
-## Configuration Reference
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `session_service.database_url` | (required) | Postgres connection string |
-| `sources` | (required) | List of `{name, topic}` source systems |
-| `expected_sources` | (required) | Sources that must all report for reconciliation |
-| `correlation_window` | `5m` | Time to wait for all sources per trade |
-| `sweep_interval` | `30s` | How often to check for expired trades |
-| `output.reconciled_topic` | (required) | Where matched events are published |
-| `output.break_topic` | (required) | Where break events are published |
-| `output.workflow_trigger_topic` | (optional) | A2A topic to trigger a workflow on break |
-| `queue_prefix` | namespace | Prefix for the durable queue name |
-
-## Event Formats
-
-### Input: Trade Event
-```json
-{
-  "trade_id": "TRD-20260703-000001",
-  "source": "solar",
-  "timestamp": "2026-07-03T14:30:00Z",
-  "instrument": "ES0113211835",
-  "quantity": 1000,
-  "price": 12.50,
-  "currency": "EUR",
-  "counterparty": "BBVA-Madrid"
-}
-```
-
-### Output: Reconciled Event
-```json
-{
-  "trade_id": "TRD-20260703-000001",
-  "sources": ["client_reporting", "murex", "solar"],
-  "reconciled_at": "2026-07-03T14:30:02Z",
-  "match_duration_ms": 2000,
-  "events": [...]
-}
-```
-
-### Output: Break Event (triggers workflow)
-```json
-{
-  "trade_id": "TRD-20260703-000002",
-  "missing_sources": ["client_reporting"],
-  "received_sources": ["murex", "solar"],
-  "detected_at": "2026-07-03T14:35:30Z",
-  "window_expiry": "2026-07-03T14:35:00Z",
-  "events": [...]
-}
-```
-
-## Running Tests
-
-The engine tests use an in-memory store (no Postgres required):
+## Go
 
 ```bash
-go test -race -count=1 ./internal/...
+go test ./...
+go run . --schema
 ```
 
-## Design Decisions
+Run those commands in [go/toolsets/event-correlator/src/](go/toolsets/event-correlator/src/), or validate from the repository root:
 
-- **Postgres over in-memory**: correlation windows can be hours/days; state must survive restarts; regulatory audit trail is mandatory
-- **Shared SAM database**: uses the same `DATABASE_URL` as SAM's session service; no separate infrastructure
-- **Store interface**: swap Postgres for any backend (the `memory` implementation is used in tests)
-- **UPSERT with ON CONFLICT DO NOTHING**: duplicate source events are idempotent at the DB level
-- **Periodic sweep (not per-trade timers)**: bounds goroutine count regardless of trade volume
-- **Workflow trigger on break**: configurable A2A publish so SAM workflows react autonomously
-- **Remover interface**: clean undeploy deprovisions broker resources
+```bash
+sam toolset validate event-correlator go
+```
+
+## Python
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install '.[dev]'
+.venv/bin/pytest
+.venv/bin/python -m event_correlator --schema
+```
+
+Run those commands in [python/toolsets/event-correlator/src/](python/toolsets/event-correlator/src/), or validate from the repository root:
+
+```bash
+sam toolset validate event-correlator python
+```
+
+## Packaging
+
+Point the SAM CLI at the language directory and the platform URL so dependencies and binaries match the Secure Tool Runtime architecture:
+
+```bash
+sam toolset package event-correlator go --url https://platform.example.com \
+  --output event-correlator-go.zip
+sam toolset package event-correlator python --url https://platform.example.com \
+  --output event-correlator-python.zip
+```
+
+## Data model and concurrency
+
+Both implementations create and use the same tables:
+
+- `pending_events` holds one row per `(trade_id, source)` until the correlation is finalized.
+- `audit_log` stores immutable `reconciled` and `break` outcomes.
+
+Each trade is processed under a PostgreSQL transaction-level advisory lock. This prevents duplicate finalization when multiple tool invocations—or a mixed Go/Python deployment—operate concurrently against the same database.
 
 ## License
 

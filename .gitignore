@@ -1,15 +1,21 @@
-# Binaries
-bin/
+# Build output
+**/dist/
+*.zip
+
+# Python
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Go
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary
 *.test
-
-# Go workspace
 go.work
 go.work.sum
 

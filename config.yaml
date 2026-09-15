@@ -1,0 +1,22 @@
+# Shared configuration values for either event-correlator toolset.
+# Copy these values into the selected toolset's per-agent `toolsetConfigs`
+# entry in your Solace Agent Mesh declarative configuration.
+
+toolsetConfig:
+  configValues:
+    database_url: ${DATABASE_URL,postgres://sam:sam@localhost:5432/sam?sslmode=disable}
+    expected_sources: solar,murex,client_reporting
+    correlation_window_seconds: 300
+
+# Apply either the go/ or python/ declarative-config root, then attach the
+# resulting toolset to an agent:
+#
+# spec:
+#   toolsets:
+#     - event-correlator
+#   toolsetConfigs:
+#     - toolsetName: event-correlator
+#       configValues:
+#         database_url: ${DATABASE_URL}
+#         expected_sources: solar,murex,client_reporting
+#         correlation_window_seconds: 300
