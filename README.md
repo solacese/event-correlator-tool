@@ -1,4 +1,4 @@
-# Event Correlator for SAM Go
+# Event Correlator for Solace Agent Mesh
 
 A production-ready, Postgres-backed event correlation engine that runs as a native SAM Go AWE instance kind. It subscribes to multiple Solace topics, correlates trade events by trade ID with durable state, maintains a full audit trail, and publishes reconciled/break events that trigger downstream SAM workflows.
 
